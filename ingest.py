@@ -210,8 +210,12 @@ def ingest(force_rebuild: bool = False):
     print(f"[ingest] Text chunks: {len(text_chunks)} | Figure caption chunks: {len(caption_docs)}")
 
     # ── Embed & persist ───────────────────────────────────────────────────────
-    print("[ingest] Embedding and adding chunks to ChromaDB ...")
-    vectorstore.add_documents(all_chunks)
+    print(f"[ingest] Embedding and adding {len(all_chunks)} chunks to ChromaDB in batches ...")
+    batch_size = 5000
+    for i in range(0, len(all_chunks), batch_size):
+        batch = all_chunks[i:i + batch_size]
+        print(f"[ingest]   Adding batch {i//batch_size + 1} ({len(batch)} chunks) ...")
+        vectorstore.add_documents(batch)
 
     total_stored = vectorstore._collection.count()
     print(f"\n[ingest] ✅ Done! Added {len(all_chunks)} chunks ({len(text_chunks)} text + {len(caption_docs)} captions). Total vectors in DB: {total_stored}")
