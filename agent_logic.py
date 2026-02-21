@@ -36,7 +36,7 @@ OPENAI_MODEL   = "gpt-4o"                                    # Powerful OpenAI m
 TOP_K_RETRIEVE = 10
 TOP_K_FINAL    = 5
 MAX_REWRITES   = 2
-FAITHFULNESS_THRESHOLD = 0.45   # Below this → return safe fallback
+FAITHFULNESS_THRESHOLD = 0.20   # Below this → return safe fallback (0.2 = only catch truly hallucinated answers)
 # ──────────────────────────────────────────────────────────────────────────────
 
 
