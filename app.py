@@ -47,7 +47,15 @@ with st.sidebar:
         st.rerun()
 
     st.markdown("---")
-    st.caption("⚠️ Run `python ingest.py` first to load your PDFs.")
+    st.caption("⚙️ **Cloud Deployment Options:**")
+    if st.button("🔄 Build/Update Vector Database"):
+        with st.spinner("⏳ Ingesting PDFs and building vector database (this takes a few minutes)..."):
+            try:
+                from ingest import ingest
+                ingest()  # Runs incremental ingestion
+                st.success("✅ Database built successfully! You can now ask questions.")
+            except Exception as e:
+                st.error(f"❌ Error during ingestion: {e}")
 
 # ── Session state ──────────────────────────────────────────────────────────────
 if "messages" not in st.session_state:
