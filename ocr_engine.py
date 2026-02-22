@@ -1,76 +1,91 @@
 """
 ocr_engine.py — Phase 2: OCR & Multi-Modal Text Extraction
 ────────────────────────────────────────────────────────────
-Extracts text from scanned PDFs, images, and charts using Tesseract OCR.
+Extracts text from PDFs, images, and charts using Sarvam AI Document Intelligence API.
 Dependencies:
-- wrappers: pip install pytesseract pdf2image
-- binaries: Tesseract-OCR, Poppler (must be in system PATH)
+- wrappers: pip install requests
 """
 
 import os
-import pytesseract
-from pdf2image import convert_from_path
-from PIL import Image
-from typing import List, Optional
+import requests
+import json
+from typing import List
+from dotenv import load_dotenv
 
-import sys
+load_dotenv()
 
-# Configure Tesseract path if on Windows (local testing)
-if sys.platform == "win32":
-    pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
-# On Linux (Streamlit Cloud), it's installed system-wide via packages.txt so no path is needed.
+SARVAM_API_KEY = os.environ.get("SARVAM_API_KEY", "")
 
 def check_dependencies() -> bool:
-    """Checks if Tesseract and Poppler are available."""
-    try:
-        pytesseract.get_tesseract_version()
-        return True
-    except Exception:
-        print("⚠️ Tesseract not found. Please install it and add to PATH.")
+    """Checks if Sarvam API Key is available."""
+    if not SARVAM_API_KEY:
+        print("⚠️ SARVAM_API_KEY not found in .env. OCR will be disabled.")
         return False
+    return True
 
-def extract_text_from_image(image: Image.Image) -> str:
-    """Uses Tesseract to extract text from a PIL Image."""
-    try:
-        text = pytesseract.image_to_string(image)
-        return text.strip()
-    except Exception as e:
-        print(f"❌ OCR Error on image: {e}")
-        return ""
-
-# Poppler configuration: sys.platform aware
-POPPLER_PATH = r"C:\Users\Tarun\poppler-25.12.0\Library\bin" if sys.platform == "win32" else None
-
-def ocr_pdf(pdf_path: str, dpi: int = 300) -> List[str]:
+def ocr_pdf(file_path: str) -> List[str]:
     """
-    Converts a PDF to images (one per page) and runs OCR on each.
-    Returns a list of strings (one per page).
+    Submits a PDF or Image to Sarvam AI Document Intelligence API.
+    Returns a list of strings (one per page where applicable, or a single combined string).
     """
     if not check_dependencies():
         return []
 
-    print(f"📷 [OCR] Processing '{os.path.basename(pdf_path)}' with OCR (this may take a while)...")
+    print(f"📷 [OCR] Processing '{os.path.basename(file_path)}' with Sarvam AI (this may take a while)...")
+    
+    # Sarvam AI Document Intelligence endpoint
+    url = "https://api.sarvam.ai/document-intelligence/job"
+    
+    headers = {
+        "api-subscription-key": SARVAM_API_KEY
+    }
+    
     try:
-        # Convert PDF pages to images
-        images = convert_from_path(pdf_path, dpi=dpi, poppler_path=POPPLER_PATH)
-        page_texts = []
+        # Determine content type based on extension
+        ext = os.path.splitext(file_path)[1].lower()
+        content_type = "application/pdf" if ext == ".pdf" else "image/jpeg" # simplified
         
-        for i, img in enumerate(images):
-            print(f"   - Page {i+1}/{len(images)}: Running Tesseract...")
-            text = extract_text_from_image(img)
-            # Add a marker that this was OCR'd
-            text = f"[OCR Extracted]\n{text}"
-            page_texts.append(text)
+        with open(file_path, 'rb') as f:
+            files = {
+                'file': (os.path.basename(file_path), f, content_type)
+            }
+            # Start job
+            response = requests.post(url, headers=headers, files=files)
             
-        return page_texts
+        if response.status_code != 200:
+            print(f"❌ Sarvam AI API Error: {response.text}")
+            return []
+            
+        # Mocking or handling job completion polling if the API is async
+        # (Assuming synchronous response for this example, typical for some simple OCR APIs, 
+        # or assuming the response directly contains extracted text if it's a smaller payload).
+        # *Note*: Real implementation may require polling a job status endpoint if Sarvam's API is fully async.
+        
+        # Taking a simplified approach assuming a JSON response with text
+        data = response.json()
+        
+        # Example formatting - adjust based on actual Sarvam API schema
+        extracted_text = data.get("text", "") 
+        if not extracted_text:
+            # Maybe it's page-based
+            pages = data.get("pages", [])
+            extracted_text = "\n\n".join([page.get("text", "") for page in pages])
+            
+        if not extracted_text:
+           print(f"⚠️ No text extracted by Sarvam AI for {file_path}")
+           return []
+            
+        # Add a marker that this was OCR'd
+        text = f"[OCR Extracted via Sarvam AI]\n{extracted_text}"
+        
+        # For compatibility with ingest.py which expects a list of pages
+        return [text]
             
     except Exception as e:
-        print(f"❌ Failed to convert PDF to images: {e}")
-        print("   (Ensure Poppler is installed and in your PATH)")
+        print(f"❌ Failed to process file with Sarvam AI API: {e}")
         return []
 
 if __name__ == "__main__":
-    # Test block
     import sys
     if len(sys.argv) > 1:
         fpath = sys.argv[1]

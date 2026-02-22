@@ -1,21 +1,21 @@
-# Environment variables (API keys)
-.env
-
-# Vector database (large files, should be re-ingested locally or on server)
-db/
-db_v2/
-
-# Python cache and environments
+# Python
 __pycache__/
-*.pyc
-.pytest_cache/
-.venv/
-venv/
+*.py[cod]
+*$py.class
+*.so
+
+# Environments
+.env
+.venv
 env/
+venv/
+ENV/
+
+# Database and Data
+db_v2/
+sarvam_db/
+data/
 
 # OS generated files
 .DS_Store
 Thumbs.db
-
-# Any random test PDFs not meant for git
-data/test_*.pdf

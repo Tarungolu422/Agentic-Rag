@@ -1,129 +1,129 @@
 """
 ingest.py — Data Ingestion & Vector Engine
-Loads all PDFs from /data, splits them into chunks, and stores them
-in a persistent ChromaDB vector store.
+─────────────────────────────────────────────────────────────────────
+Loads PDFs from /data, splits into chunks, stores in ChromaDB.
 
-🆕 Incremental mode (default):
-   - If the DB already exists, only newly added PDFs are ingested.
-   - Already-ingested files are skipped automatically.
-   - No need to delete the DB when you add new PDFs!
+✅ Incremental mode (default):
+   - Tracks ingested filenames in sarvam_db/.ingested_files.json
+   - Only NEW files are processed — already-ingested ones are skipped.
+   - The JSON file is the single source of truth (no ChromaDB metadata queries).
 
-🆕 Figure caption extraction:
-   - Automatically finds "Figure X:", "Fig. X", "Table X:" captions
-   - Stores them as dedicated chunks tagged source_type='figure_caption'
-   - Makes image/chart content searchable without any Vision API calls!
+✅ Force rebuild:
+   - Deletes DB + JSON tracking file, then re-ingests everything.
 
-Embeddings: HuggingFace sentence-transformers (runs 100% locally, no API key needed)
-LLM:        OpenAI GPT-4o (only used in agent_logic.py, not here)
+Embeddings : HuggingFace sentence-transformers (local, no API key needed)
 """
 
 import os
 import re
+import json
 import shutil
 from dotenv import load_dotenv
 load_dotenv()
 
+import chromadb
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_chroma import Chroma
 from langchain_huggingface import HuggingFaceEmbeddings
 
 # ── Config ────────────────────────────────────────────────────────────────────
-DATA_DIR      = "./data"
-DB_DIR        = "./db_v2"
-CHUNK_SIZE    = 1200
-CHUNK_OVERLAP = 200
-MAX_FILES     = None   # None = ingest ALL PDFs in /data
-
-# Best free local embedding model — small, fast, high quality
-# Downloads ~90MB once, then runs offline forever
-EMBED_MODEL   = "sentence-transformers/all-MiniLM-L6-v2"
+DATA_DIR        = "./data"
+DB_DIR          = "./sarvam_db"
+COLLECTION_NAME = "rag_docs"          # Must match agent_logic.py
+TRACKING_FILE   = os.path.join(DB_DIR, ".ingested_files.json")  # ← source of truth
+CHUNK_SIZE      = 1200
+CHUNK_OVERLAP   = 200
+MAX_FILES       = None                # None = ingest ALL PDFs
+EMBED_MODEL     = "sentence-transformers/all-MiniLM-L6-v2"
 # ──────────────────────────────────────────────────────────────────────────────
 
 
-def get_already_ingested_files(vectorstore: Chroma) -> set:
-    """Return the set of filenames already present in the vector store."""
-    try:
-        result = vectorstore.get(include=["metadatas"])
-        ingested = {
-            meta["filename"]
-            for meta in result["metadatas"]
-            if meta and "filename" in meta
-        }
-        return ingested
-    except Exception as e:
-        print(f"[ingest] Warning: could not read existing metadata ({e}). Treating DB as empty.")
-        return set()
+# ── Tracking helpers (JSON file — reliable, no ChromaDB queries) ──────────────
+def _load_tracked_files() -> set:
+    """Return the set of filenames already ingested (read from JSON file)."""
+    if os.path.exists(TRACKING_FILE):
+        try:
+            with open(TRACKING_FILE, "r") as f:
+                return set(json.load(f))
+        except Exception:
+            pass
+    return set()
 
 
-# Caption pattern: matches "Figure 1:", "Fig. 2a", "Table 3.", "Eq. (4)" etc.
+def _save_tracked_files(filenames: set):
+    """Persist the updated set of ingested filenames to the JSON file."""
+    os.makedirs(DB_DIR, exist_ok=True)
+    with open(TRACKING_FILE, "w") as f:
+        json.dump(sorted(filenames), f, indent=2)
+
+
+# ── ChromaDB helpers ──────────────────────────────────────────────────────────
+def _make_vectorstore(embeddings) -> Chroma:
+    """Open (or create) the ChromaDB collection using an explicit PersistentClient.
+    This avoids the 'default_tenant not found' error in ChromaDB ≥1.5."""
+    client = chromadb.PersistentClient(path=DB_DIR)
+    return Chroma(
+        client=client,
+        collection_name=COLLECTION_NAME,
+        embedding_function=embeddings,
+    )
+
+
+# ── Caption extractor ─────────────────────────────────────────────────────────
 _CAPTION_RE = re.compile(
     r'((?:Fig(?:ure|\.)?|Table|Eq(?:uation|\.)?|Plate)\s*[\dA-Za-z]+[.:]?[^\n]{10,200})',
     re.IGNORECASE,
 )
 
-
 def extract_figure_captions(docs, fname: str):
-    """
-    Pull figure/table/equation captions out of loaded pages and return them
-    as dedicated Document chunks tagged with source_type='figure_caption'.
-
-    These chunks are free to produce (pure regex — no API calls) and make
-    visual content searchable: when a user asks about a figure, the retriever
-    can now find "Figure 5: SEM micrograph of γ′ precipitates..." directly.
-    """
+    """Pull figure/table captions as dedicated searchable chunks."""
     from langchain_core.documents import Document
     caption_docs = []
     for doc in docs:
         page_num = doc.metadata.get("page", 0)
-        matches  = _CAPTION_RE.findall(doc.page_content)
-        for caption in matches:
+        for caption in _CAPTION_RE.findall(doc.page_content):
             caption = caption.strip()
-            if len(caption) < 15:   # skip noise
+            if len(caption) < 15:
                 continue
             caption_docs.append(Document(
                 page_content=caption,
-                metadata={
-                    "filename":    fname,
-                    "page":        page_num,
-                    "source_type": "figure_caption",
-                },
+                metadata={"filename": fname, "page": page_num, "source_type": "figure_caption"},
             ))
     return caption_docs
 
 
+# ── Main ingest function ──────────────────────────────────────────────────────
 def ingest(force_rebuild: bool = False):
     """
-    Main ingestion function.
-
     Parameters
     ----------
     force_rebuild : bool
-        If True, delete the existing DB and re-ingest ALL PDFs from scratch.
-        Default is False (incremental — only new files are added).
+        If True, wipe the DB + tracking file and re-ingest everything.
+        Default is False — only new files are processed.
     """
 
-    # ── Optionally wipe the DB ────────────────────────────────────────────────
-    if force_rebuild and os.path.exists(DB_DIR):
-        print(f"[ingest] force_rebuild=True — deleting existing DB at '{DB_DIR}' ...")
-        shutil.rmtree(DB_DIR)
-        print("[ingest] DB deleted. Re-ingesting all PDFs from scratch.")
+    # ── Wipe if force_rebuild ─────────────────────────────────────────────────
+    if force_rebuild:
+        if os.path.exists(DB_DIR):
+            print(f"[ingest] force_rebuild — deleting '{DB_DIR}' ...")
+            shutil.rmtree(DB_DIR)
+            print("[ingest] DB deleted.")
+        # Tracking file is inside DB_DIR, so it's already gone.
 
-    # ── Load embedding model (needed whether DB exists or not) ─────────────────
-    print(f"[ingest] Loading embedding model '{EMBED_MODEL}' (downloads once ~90MB) ...")
+    os.makedirs(DB_DIR, exist_ok=True)
+
+    # ── Load embedding model ──────────────────────────────────────────────────
+    print(f"[ingest] Loading embedding model '{EMBED_MODEL}' ...")
     embeddings = HuggingFaceEmbeddings(
         model_name=EMBED_MODEL,
-        model_kwargs={"device": "cpu"},        # Change to "cuda" if you have a GPU
+        model_kwargs={"device": "cpu"},
         encode_kwargs={"normalize_embeddings": True},
     )
 
-    # ── Connect to (or create) the vector store ───────────────────────────────
-    vectorstore = Chroma(
-        persist_directory=DB_DIR,
-        embedding_function=embeddings,
-    )
+    # ── Check which files are already tracked ─────────────────────────────────
+    already_ingested = _load_tracked_files()
 
-    # ── Discover which PDFs are new ───────────────────────────────────────────
     if not os.path.exists(DATA_DIR):
         raise FileNotFoundError(f"Data folder '{DATA_DIR}' not found.")
 
@@ -131,64 +131,59 @@ def ingest(force_rebuild: bool = False):
     if MAX_FILES is not None:
         all_pdfs = all_pdfs[:MAX_FILES]
 
-    already_ingested = get_already_ingested_files(vectorstore)
     new_pdfs = [f for f in all_pdfs if f not in already_ingested]
 
-    print(f"[ingest] PDFs found:      {len(all_pdfs)}")
-    print(f"[ingest] Already in DB:   {len(already_ingested)}")
-    print(f"[ingest] New to ingest:   {len(new_pdfs)}")
+    print(f"[ingest] PDFs found:    {len(all_pdfs)}")
+    print(f"[ingest] Already done:  {len(already_ingested)}")
+    print(f"[ingest] New to ingest: {len(new_pdfs)}")
 
     if not new_pdfs:
-        print("[ingest] ✅ Nothing to do — all PDFs are already in the vector store.")
+        print("[ingest] ✅ Nothing to do — all PDFs are already ingested.")
         return
 
-    # ── OCR engine (optional) ─────────────────────────────────────────────────
+    # ── Optional OCR fallback ─────────────────────────────────────────────────
     try:
         import ocr_engine
-        from langchain_core.documents import Document
+        from langchain_core.documents import Document as LCDoc
     except ImportError:
         ocr_engine = None
-        print("⚠️ ocr_engine not found or dependencies missing. Skipping OCR fallback.")
 
     # ── Load new PDFs ─────────────────────────────────────────────────────────
-    print(f"\n[ingest] Loading {len(new_pdfs)} new PDF(s) from '{DATA_DIR}' ...")
-    documents = []
+    print(f"\n[ingest] Loading {len(new_pdfs)} new PDF(s) ...")
+    documents       = []
+    successfully_loaded = []
+
     for fname in new_pdfs:
         fpath = os.path.join(DATA_DIR, fname)
         try:
-            # 1. Try standard text extraction
-            docs = PyPDFLoader(fpath).load()
+            try:
+                docs = PyPDFLoader(fpath).load()
+            except Exception as enc_err:
+                print(f"  ⚠️  {fname} encoding issue ({enc_err}), retrying ...")
+                docs = PyPDFLoader(fpath, extraction_mode="plain").load()
 
-            # 2. Check for scanned pages (avg text length < 50 chars/page → OCR)
+            # Low text density → try Sarvam OCR
             total_chars = sum(len(d.page_content.strip()) for d in docs)
             avg_chars   = total_chars / len(docs) if docs else 0
-
             if avg_chars < 50 and ocr_engine:
-                print(f"  🔍 {fname} looks scanned (avg {avg_chars:.1f} chars/page). Trying OCR ...")
+                print(f"  🔍 {fname} looks scanned (avg {avg_chars:.1f} chars/page), running OCR ...")
                 ocr_texts = ocr_engine.ocr_pdf(fpath)
                 if ocr_texts:
                     docs = [
-                        Document(page_content=text, metadata={"filename": fname, "page": i})
-                        for i, text in enumerate(ocr_texts)
+                        LCDoc(page_content=t, metadata={"filename": fname, "page": i})
+                        for i, t in enumerate(ocr_texts)
                     ]
-                    print(f"  ✅ OCR recovered {len(docs)} pages for {fname}")
-                else:
-                    print(f"  ⚠️ OCR failed for {fname}, keeping original (empty) content.")
 
-            # 3. Ensure metadata is set
             for i, doc in enumerate(docs):
                 doc.metadata["filename"]    = fname
-                doc.metadata["source_type"] = "text"   # tag text chunks explicitly
-                if "page" not in doc.metadata:
-                    doc.metadata["page"] = i
+                doc.metadata.setdefault("source_type", "text")
+                doc.metadata.setdefault("page", i)
 
-            documents.extend(docs)
-
-            # 4. Extract figure/table captions as dedicated searchable chunks
             captions = extract_figure_captions(docs, fname)
+            documents.extend(docs)
             documents.extend(captions)
-
-            print(f"  ✓ {fname} ({len(docs)} pages, {len(captions)} figure captions extracted)")
+            successfully_loaded.append(fname)
+            print(f"  ✓ {fname} — {len(docs)} pages, {len(captions)} captions")
 
         except Exception as e:
             print(f"  ✗ {fname} — skipped ({e})")
@@ -196,40 +191,45 @@ def ingest(force_rebuild: bool = False):
     if not documents:
         raise ValueError("No pages could be loaded from the new PDFs.")
 
-    # ── Chunk ─────────────────────────────────────────────────────────────────
-    print("\n[ingest] Splitting text documents into chunks ...")
+    # ── Split ─────────────────────────────────────────────────────────────────
+    print("\n[ingest] Splitting documents into chunks ...")
     text_docs    = [d for d in documents if d.metadata.get("source_type") != "figure_caption"]
     caption_docs = [d for d in documents if d.metadata.get("source_type") == "figure_caption"]
-    splitter = RecursiveCharacterTextSplitter(
-        chunk_size=CHUNK_SIZE,
-        chunk_overlap=CHUNK_OVERLAP,
+    splitter     = RecursiveCharacterTextSplitter(
+        chunk_size=CHUNK_SIZE, chunk_overlap=CHUNK_OVERLAP,
         separators=["\n\n", "\n", ". ", " ", ""],
     )
     text_chunks = splitter.split_documents(text_docs)
-    all_chunks  = text_chunks + caption_docs   # captions are short — no splitting needed
-    print(f"[ingest] Text chunks: {len(text_chunks)} | Figure caption chunks: {len(caption_docs)}")
+    all_chunks  = text_chunks + caption_docs
+    print(f"[ingest] {len(text_chunks)} text + {len(caption_docs)} captions = {len(all_chunks)} chunks")
 
-    # ── Embed & persist ───────────────────────────────────────────────────────
-    print(f"[ingest] Embedding and adding {len(all_chunks)} chunks to ChromaDB in batches ...")
+    # ── Embed & store ─────────────────────────────────────────────────────────
+    print(f"[ingest] Embedding {len(all_chunks)} chunks into ChromaDB ...")
+    vectorstore = _make_vectorstore(embeddings)
+
     batch_size = 5000
     for i in range(0, len(all_chunks), batch_size):
         batch = all_chunks[i:i + batch_size]
-        print(f"[ingest]   Adding batch {i//batch_size + 1} ({len(batch)} chunks) ...")
+        print(f"[ingest]   Batch {i//batch_size + 1}: {len(batch)} chunks ...")
         vectorstore.add_documents(batch)
 
-    total_stored = vectorstore._collection.count()
-    print(f"\n[ingest] ✅ Done! Added {len(all_chunks)} chunks ({len(text_chunks)} text + {len(caption_docs)} captions). Total vectors in DB: {total_stored}")
+    total = vectorstore._collection.count()
+    print(f"\n[ingest] ✅ Done! {len(all_chunks)} chunks added. Total in DB: {total}")
+
+    # ── Update tracking file ──────────────────────────────────────────────────
+    # Only mark files as done AFTER they were successfully embedded.
+    updated_set = already_ingested | set(successfully_loaded)
+    _save_tracked_files(updated_set)
+    print(f"[ingest] Tracking file updated — {len(updated_set)} files marked as done.")
+
+    # Release ChromaDB reference (del is enough on all platforms)
+    del vectorstore
 
 
 if __name__ == "__main__":
     import argparse
-
-    parser = argparse.ArgumentParser(description="Ingest PDFs into the ChromaDB vector store.")
-    parser.add_argument(
-        "--rebuild",
-        action="store_true",
-        help="Delete existing DB and re-ingest ALL PDFs from scratch.",
-    )
+    parser = argparse.ArgumentParser(description="Ingest PDFs into the Sarvam RAG database.")
+    parser.add_argument("--rebuild", action="store_true",
+                        help="Delete the database and re-ingest ALL PDFs from scratch.")
     args = parser.parse_args()
-
     ingest(force_rebuild=args.rebuild)

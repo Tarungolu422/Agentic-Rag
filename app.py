@@ -4,6 +4,8 @@ Run with:  streamlit run app.py
 """
 
 import os
+import sys
+import shutil
 from dotenv import load_dotenv
 load_dotenv()  # Loads .env before anything else
 
@@ -17,153 +19,312 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
+# ── Helpers ───────────────────────────────────────────────────────────────────
+DATA_DIR = "./data"
+DB_DIR   = "./sarvam_db"   # Renamed from db_v2
+
 # ── Sidebar ────────────────────────────────────────────────────────────────────
 with st.sidebar:
     st.title("📚 Research Assistant")
     st.markdown(
         """
         **Powered by:**
-        - 🤖 OpenAI GPT-4o
+        - 🤖 Sarvam AI (Chat & OCR)
         - 🔗 LangGraph (Agentic RAG)
         - 🗄️ ChromaDB (Vector Memory)
         ---
         **How it works:**
-        1. Your question is sent to ChromaDB
-        2. Top 10 chunks are retrieved & re-ranked
-        3. GPT-4o grades chunk relevance
-        4. If irrelevant → query is rewritten & retried
-        5. Final answer is generated with citations
+        1. Upload your PDFs or images in the **Upload** tab
+        2. They are automatically embedded into ChromaDB
+        3. Ask questions — answers come with source citations
         ---
         """
     )
 
-    if not os.environ.get("OPENAI_API_KEY"):
-        st.error("⚠️ OPENAI_API_KEY not found in .env file.")
+    if not os.environ.get("SARVAM_API_KEY"):
+        st.error("⚠️ SARVAM_API_KEY not found in .env file.")
     else:
-        st.success("✅ OpenAI API key loaded")
+        st.success("✅ Sarvam API key loaded")
 
     if st.button("🗑️ Clear Chat History"):
         st.session_state.messages = []
         st.rerun()
 
+
+
     st.markdown("---")
-    st.caption("⚙️ **Cloud Deployment Options:**")
-    if st.button("🔄 Build/Update Vector Database"):
-        with st.spinner("⏳ Ingesting PDFs and building vector database (this takes a few minutes)..."):
+    st.caption("⚙️ **Advanced:**")
+    if st.button("🔄 Force Rebuild Database"):
+        with st.spinner("⏳ Rebuilding from scratch..."):
             try:
+                # Clear the cached graph/ChromaDB connection FIRST to avoid WinError 32
+                st.cache_resource.clear()
                 from ingest import ingest
-                ingest()  # Runs incremental ingestion
-                st.success("✅ Database built successfully! You can now ask questions.")
+                ingest(force_rebuild=True)
+                st.success("✅ Database rebuilt!")
+                st.rerun()
             except Exception as e:
-                st.error(f"❌ Error during ingestion: {e}")
+                st.error(f"❌ {e}")
+
 
 # ── Session state ──────────────────────────────────────────────────────────────
 if "messages" not in st.session_state:
     st.session_state.messages = []
 
-# ── Header ─────────────────────────────────────────────────────────────────────
-st.title("📚 Multi-Document Research Assistant")
-st.markdown(
-    "Ask anything about your research papers. "
-    "All answers are **grounded in your documents** — no hallucinations."
-)
-st.divider()
 
-# ── Chat history display ───────────────────────────────────────────────────────
-for msg in st.session_state.messages:
-    with st.chat_message(msg["role"]):
-        st.markdown(msg["content"])
-        if msg["role"] == "assistant" and msg.get("sources"):
-            with st.expander("📄 Sources used", expanded=False):
-                for src in msg["sources"]:
-                    st.markdown(f"- `{src}`")
+# ── Tabs: Chat | Upload ────────────────────────────────────────────────────────
+tab_chat, tab_upload = st.tabs(["💬 Chat", "📁 Upload Documents"])
 
-# ── Input ──────────────────────────────────────────────────────────────────────
-user_input = st.chat_input("Ask a question about your research papers...")
 
-if user_input:
-    # Guard: API key must be set
-    if not os.environ.get("OPENAI_API_KEY"):
-        st.error("⚠️ OPENAI_API_KEY not found. Please add it to your .env file and restart.")
-        st.stop()
+# ══════════════════════════════════════════════════════════════════════════════
+# UPLOAD TAB
+# ══════════════════════════════════════════════════════════════════════════════
+with tab_upload:
+    st.markdown("## 📁 Upload Documents")
+    st.markdown(
+        "Upload your **PDFs or images** below. They will be automatically "
+        "processed and added to your knowledge base so you can ask questions "
+        "about them in the **Chat** tab."
+    )
 
-    # Guard: Vector DB must exist
-    if not os.path.exists("./db_v2") or not os.listdir("./db_v2"):
-        st.error(
-            "⚠️ Vector database not found. "
-            "Please run `python ingest.py` to process your PDF files first."
+    uploaded_files = st.file_uploader(
+        "Drag & drop files here or click to browse",
+        type=["pdf", "png", "jpg", "jpeg"],
+        accept_multiple_files=True,
+        help="Supported formats: PDF, PNG, JPG, JPEG",
+        label_visibility="visible",
+    )
+
+    col1, col2, col3 = st.columns([2, 1, 2])
+    with col2:
+        process_btn = st.button("⚡ Process & Ingest", type="primary", use_container_width=True)
+
+    if uploaded_files and process_btn:
+        os.makedirs(DATA_DIR, exist_ok=True)
+
+        # ── Step 1: Save uploaded files ────────────────────────────────────────
+        st.markdown("---")
+        st.markdown("#### Processing files…")
+        progress_bar = st.progress(0, text="Saving files…")
+
+        saved = []
+        skipped = []
+        for idx, f in enumerate(uploaded_files):
+            dest = os.path.join(DATA_DIR, f.name)
+            if os.path.exists(dest):
+                skipped.append(f.name)
+            else:
+                with open(dest, "wb") as out:
+                    out.write(f.getbuffer())
+                saved.append(f.name)
+            progress_bar.progress(
+                int((idx + 1) / len(uploaded_files) * 40),
+                text=f"Saving {f.name}…",
+            )
+
+        if skipped:
+            st.info(f"ℹ️ Already in library (skipped): {', '.join(skipped)}")
+
+        if not saved:
+            st.warning("No new files to process — all uploads already exist in the library.")
+            st.stop()
+
+        st.success(f"✅ Saved {len(saved)} new file(s): {', '.join(saved)}")
+
+        # ── Step 2: Ingest into ChromaDB ───────────────────────────────────────
+        progress_bar.progress(50, text="Loading embedding model…")
+        try:
+            # ✅ CRITICAL: Clear cached ChromaDB connection BEFORE ingest opens the DB.
+            # Without this, two PersistentClients try to hold the same file and
+            # Windows raises WinError 32 (file locked by another process).
+            st.cache_resource.clear()
+
+            from ingest import ingest
+            ingest()   # incremental — only processes newly saved files
+            progress_bar.progress(100, text="Done!")
+            st.balloons()
+            st.success(
+                f"🎉 **Successfully Added!** {len(saved)} document(s) have been processed "
+                "and added to your knowledge base. Switch to the **💬 Chat** tab to start asking questions."
+            )
+        except Exception as e:
+            progress_bar.empty()
+            st.error(f"❌ Ingestion failed: {e}")
+
+    elif uploaded_files and not process_btn:
+        # Preview the selected files before processing
+        st.markdown("---")
+        st.markdown(f"**{len(uploaded_files)} file(s) selected** — click **⚡ Process & Ingest** to add them.")
+        for f in uploaded_files:
+            size_kb = len(f.getvalue()) / 1024
+            st.markdown(f"- 📄 `{f.name}` ({size_kb:.1f} KB)")
+
+    # ── Current library snapshot ───────────────────────────────────────────────
+    st.markdown("---")
+    with st.expander("📚 Current Knowledge Base", expanded=False):
+        data_files = []
+        if os.path.exists(DATA_DIR):
+            data_files = sorted([
+                f for f in os.listdir(DATA_DIR)
+                if f.lower().endswith((".pdf", ".png", ".jpg", ".jpeg"))
+            ])
+
+        if data_files:
+            st.caption(f"{len(data_files)} file(s) in `./data/`")
+            for fname in data_files:
+                fpath = os.path.join(DATA_DIR, fname)
+                size_kb = os.path.getsize(fpath) / 1024
+                st.markdown(f"- 📄 `{fname}` ({size_kb:.1f} KB)")
+        else:
+            st.caption("No files yet. Upload some above!")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# CHAT TAB
+# ══════════════════════════════════════════════════════════════════════════════
+with tab_chat:
+    st.markdown("## 💬 Multi-Document Research Assistant")
+    st.markdown(
+        "Ask anything about your research papers. "
+        "All answers are **grounded in your documents** — no hallucinations."
+    )
+    st.divider()
+
+    # ── Chat history display ───────────────────────────────────────────────────
+    for msg in st.session_state.messages:
+        with st.chat_message(msg["role"]):
+            st.markdown(msg["content"])
+            if msg["role"] == "assistant" and msg.get("sources"):
+                with st.expander("📄 Sources used", expanded=False):
+                    for src in msg["sources"]:
+                        if isinstance(src, dict):
+                            st.markdown(f"- 📄 `{src.get('file','?')}` — Page {src.get('page','?')}")
+                        else:
+                            st.markdown(f"- `{src}`")
+
+    # ── Chat input ─────────────────────────────────────────────────────────────
+    user_input = st.chat_input("Ask a question about your research papers…")
+
+    if user_input:
+        # Guard: API key
+        if not os.environ.get("SARVAM_API_KEY"):
+            st.error("⚠️ SARVAM_API_KEY not found. Add it to your .env file and restart.")
+            st.stop()
+
+        # Guard: DB must exist
+        # ChromaDB creates 'db_v2' folder even if it's empty, so we must check for actual DB files
+        db_has_data = os.path.exists(DB_DIR) and (
+            os.path.exists(os.path.join(DB_DIR, "chroma.sqlite3")) or 
+            len(os.listdir(DB_DIR)) > 0
         )
-        st.stop()
+        if not db_has_data:
+            st.error(
+                "⚠️ Knowledge base is empty. "
+                "Go to the **📁 Upload Documents** tab to add your PDFs first."
+            )
+            st.stop()
 
-    # Display user message
-    st.session_state.messages.append({"role": "user", "content": user_input})
-    with st.chat_message("user"):
-        st.markdown(user_input)
+        # Display user message
+        st.session_state.messages.append({"role": "user", "content": user_input})
+        with st.chat_message("user"):
+            st.markdown(user_input)
 
-    # Run the agent
-    with st.chat_message("assistant"):
-        with st.spinner("🔍 Thinking — retrieving, re-ranking, and generating answer..."):
+        # Build chat_history from prior session (exclude current user turn)
+        history_msgs = [
+            {"role": m["role"], "content": m["content"]}
+            for m in st.session_state.messages[:-1]
+            if m["role"] in ("user", "assistant")
+        ]
+
+        sources = []
+
+        # Run the agent with streaming
+        with st.chat_message("assistant"):
             try:
-                # Import here so API key is set before importing
-                from agent_logic import run_query
-                result = run_query(user_input)
-                answer  = result["answer"]
-                sources = result["sources"]
+                from agent_logic import run_query_stream
+
+                def _stream_and_capture():
+                    gen = run_query_stream(user_input, chat_history=history_msgs)
+                    try:
+                        while True:
+                            token = next(gen)
+                            yield token
+                    except StopIteration as e:
+                        if e.value:
+                            sources.extend(e.value)
+
+                # Phase 1 — retrieval status banner
+                status = st.status("🔍 Retrieving and re-ranking documents…", expanded=False)
+                stream_gen = _stream_and_capture()
+
+                # Pull first token (blocks until retrieval/grading done)
+                first_token = next(stream_gen, None)
+                status.update(label="✅ Retrieved — generating answer", state="complete")
+
+                def _full_stream():
+                    if first_token is not None:
+                        yield first_token
+                    yield from stream_gen
+
+                answer = st.write_stream(_full_stream())
+
             except Exception as e:
                 answer  = f"❌ An error occurred: {str(e)}"
+                st.markdown(answer)
                 sources = []
 
-        st.markdown(answer)
+            # ── Sources & PDF Page Preview ───────────────────────────────
+            if sources:
+                with st.expander("📄 Sources used & Page Preview", expanded=True):
+                    for src in sources:
+                        if isinstance(src, str):
+                            st.markdown(f"- `{src}`")
+                            continue
 
-        if sources:
-            with st.expander("📄 Sources used & Visual Context", expanded=True):
-                import os
-                import sys
-                from pdf2image import convert_from_path
+                        fname = src.get("file", "unknown")
+                        page  = src.get("page", 1)   # 1-indexed
+                        st.markdown(f"**📄 {fname}** — cited from Page {page}")
 
-                # Smart path for Poppler: None on Linux (Streamlit Cloud), hardcoded on Windows
-                POPPLER_PATH = r"C:\Users\Tarun\poppler-25.12.0\Library\bin" if sys.platform == "win32" else None
+                        pdf_path = os.path.join(DATA_DIR, fname)
+                        if os.path.exists(pdf_path) and fname.lower().endswith(".pdf"):
+                            try:
+                                import fitz  # PyMuPDF — no Poppler needed
 
-                for src in sources:
-                    if isinstance(src, str):
-                        st.markdown(f"- `{src}`")
-                        continue
+                                doc = fitz.open(pdf_path)
+                                total_pages = doc.page_count
 
-                    fname = src.get("file", "unknown")
-                    page  = src.get("page", 1)
-                    st.markdown(f"**📄 {fname}** — cited from Page {page}")
+                                # Show cited page ± 1
+                                pages_to_show = [
+                                    p for p in [page - 2, page - 1, page]
+                                    if 0 <= p < total_pages
+                                ]
 
-                    pdf_path = os.path.join("./data", fname)
-                    if os.path.exists(pdf_path):
-                        try:
-                            # Show a window of pages: cited page minus 1, cited page, cited page plus 1
-                            # This ensures we capture figures that appear on an adjacent page to their caption
-                            first = max(1, page - 1)
-                            last  = page + 1  # pdf2image handles out-of-range gracefully
-                            images = convert_from_path(
-                                pdf_path,
-                                first_page=first,
-                                last_page=last,
-                                poppler_path=POPPLER_PATH,
-                            )
-                            if images:
-                                cols = st.columns(len(images))
-                                for col_idx, (img, pg_num) in enumerate(zip(images, range(first, last + 1))):
-                                    with cols[col_idx]:
-                                        border = "🔵 " if pg_num == page else ""
-                                        st.image(img, caption=f"{border}Page {pg_num}")
-                                st.caption("🔵 Blue border = cited page. Adjacent pages shown to help locate figures.")
-                        except Exception as e:
-                            st.caption(f"⚠️ Could not load image preview: {e}")
-                    else:
-                        st.caption(f"⚠️ File not found in data/: {fname}")
-                    st.divider()
-        else:
-            st.caption("_No sources cited — answer may be a fallback response._")
+                                cols = st.columns(len(pages_to_show)) if pages_to_show else []
+                                for col, pg_idx in zip(cols, pages_to_show):
+                                    pg = doc[pg_idx]
+                                    # Render at 1.5x zoom
+                                    mat = fitz.Matrix(1.5, 1.5)
+                                    pix = pg.get_pixmap(matrix=mat)
+                                    img_bytes = pix.tobytes("png")
+                                    label = f"🔵 Page {pg_idx + 1} (cited)" if pg_idx + 1 == page else f"Page {pg_idx + 1}"
+                                    with col:
+                                        st.image(img_bytes, caption=label, use_container_width=True)
 
-    # Save to history
-    st.session_state.messages.append({
-        "role":    "assistant",
-        "content": answer,
-        "sources": sources,
-    })
+                                doc.close()
+                                st.caption("🔵 Blue label = cited page")
+
+                            except Exception as img_err:
+                                st.caption(f"⚠️ Could not render page preview: {img_err}")
+                        else:
+                            st.caption(f"⚠️ File not found in data/: {fname}")
+
+                        st.divider()
+            else:
+                st.caption("_No sources cited — answer may be a fallback response._")
+
+        # Save to history
+        st.session_state.messages.append({
+            "role":    "assistant",
+            "content": answer,
+            "sources": sources,
+        })

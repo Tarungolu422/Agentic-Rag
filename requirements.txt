@@ -32,7 +32,8 @@ langchain-openai>=0.1.0
 streamlit>=1.35.0
 
 # OCR & Image Processing (Phase 2)
-# Requires system dependencies: Tesseract-OCR & Poppler
-pytesseract>=0.3.10
-pdf2image>=1.17.0
+# Using Sarvam AI Document Intelligence API
+requests>=2.31.0
+sarvamai>=0.1.0
 Pillow>=10.0.0
+PyMuPDF>=1.23.0
