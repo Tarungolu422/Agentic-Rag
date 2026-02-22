@@ -191,26 +191,20 @@ with tab_chat:
     st.divider()
 
     # ── Chat history display ───────────────────────────────────────────────────
-    # Wrap messages in a fixed-height container so the input box stays pinned
-    chat_container = st.container(height=600, border=False)
-
-    with chat_container:
-        for msg in st.session_state.messages:
-            with st.chat_message(msg["role"]):
-                st.markdown(msg["content"])
-                if msg["role"] == "assistant" and msg.get("sources"):
-                    with st.expander("📄 Sources used", expanded=False):
-                        for src in msg["sources"]:
-                            if isinstance(src, dict):
-                                st.markdown(f"- 📄 `{src.get('file','?')}` — Page {src.get('page','?')}")
-                            else:
-                                st.markdown(f"- `{src}`")
+    for msg in st.session_state.messages:
+        with st.chat_message(msg["role"]):
+            st.markdown(msg["content"])
+            if msg["role"] == "assistant" and msg.get("sources"):
+                with st.expander("📄 Sources used", expanded=False):
+                    for src in msg["sources"]:
+                        if isinstance(src, dict):
+                            st.markdown(f"- 📄 `{src.get('file','?')}` — Page {src.get('page','?')}")
+                        else:
+                            st.markdown(f"- `{src}`")
 
     # Guard: DB must exist
     db_has_data = False
     if os.path.exists(DB_DIR):
-        # In ChromaDB 1.5+, the SQLite DB is usually the source of truth.
-        # But if we're using a JSON tracking file, we can also check that.
         tracking_file = os.path.join(DB_DIR, ".ingested_files.json")
         db_has_data = os.path.exists(os.path.join(DB_DIR, "chroma.sqlite3")) or os.path.exists(tracking_file)
 
@@ -218,11 +212,12 @@ with tab_chat:
         st.warning(
             "⚠️ **Knowledge base is empty!**\n\n"
             "Because this app was just deployed or reset, there are no documents in the database.\n"
-            "Go to the **📁 Upload Documents** tab in the sidebar to add your PDFs first."
+            "Go to the **📁 Upload Documents** tab to add your PDFs first."
         )
-        st.stop()  # Stops execution here, hiding the chat input below
 
-    # ── Chat input ─────────────────────────────────────────────────────────────
+# ── Chat input ─────────────────────────────────────────────────────────────
+# Placed OUTSIDE the tab block so it natively pins to the viewport bottom
+if db_has_data:
     user_input = st.chat_input("Ask a question about your research papers…")
 
     if user_input:
@@ -231,9 +226,9 @@ with tab_chat:
             st.error("⚠️ SARVAM_API_KEY not found. Add it to your .env file and restart.")
             st.stop()
 
-        # Display user message instantly inside the scrollable container
-        st.session_state.messages.append({"role": "user", "content": user_input})
-        with chat_container:
+        # Reopen tab context to draw the response inside the Chat tab
+        with tab_chat:
+            st.session_state.messages.append({"role": "user", "content": user_input})
             with st.chat_message("user"):
                 st.markdown(user_input)
 
@@ -330,9 +325,9 @@ with tab_chat:
             else:
                 st.caption("_No sources cited — answer may be a fallback response._")
 
-        # Save to history
-        st.session_state.messages.append({
-            "role":    "assistant",
-            "content": answer,
-            "sources": sources,
-        })
+            # Save to history
+            st.session_state.messages.append({
+                "role": "assistant",
+                "content": answer,
+                "sources": sources
+            })
