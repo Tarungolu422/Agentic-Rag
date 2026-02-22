@@ -191,16 +191,36 @@ with tab_chat:
     st.divider()
 
     # ── Chat history display ───────────────────────────────────────────────────
-    for msg in st.session_state.messages:
-        with st.chat_message(msg["role"]):
-            st.markdown(msg["content"])
-            if msg["role"] == "assistant" and msg.get("sources"):
-                with st.expander("📄 Sources used", expanded=False):
-                    for src in msg["sources"]:
-                        if isinstance(src, dict):
-                            st.markdown(f"- 📄 `{src.get('file','?')}` — Page {src.get('page','?')}")
-                        else:
-                            st.markdown(f"- `{src}`")
+    # Wrap messages in a fixed-height container so the input box stays pinned
+    chat_container = st.container(height=600, border=False)
+
+    with chat_container:
+        for msg in st.session_state.messages:
+            with st.chat_message(msg["role"]):
+                st.markdown(msg["content"])
+                if msg["role"] == "assistant" and msg.get("sources"):
+                    with st.expander("📄 Sources used", expanded=False):
+                        for src in msg["sources"]:
+                            if isinstance(src, dict):
+                                st.markdown(f"- 📄 `{src.get('file','?')}` — Page {src.get('page','?')}")
+                            else:
+                                st.markdown(f"- `{src}`")
+
+    # Guard: DB must exist
+    db_has_data = False
+    if os.path.exists(DB_DIR):
+        # In ChromaDB 1.5+, the SQLite DB is usually the source of truth.
+        # But if we're using a JSON tracking file, we can also check that.
+        tracking_file = os.path.join(DB_DIR, ".ingested_files.json")
+        db_has_data = os.path.exists(os.path.join(DB_DIR, "chroma.sqlite3")) or os.path.exists(tracking_file)
+
+    if not db_has_data:
+        st.warning(
+            "⚠️ **Knowledge base is empty!**\n\n"
+            "Because this app was just deployed or reset, there are no documents in the database.\n"
+            "Go to the **📁 Upload Documents** tab in the sidebar to add your PDFs first."
+        )
+        st.stop()  # Stops execution here, hiding the chat input below
 
     # ── Chat input ─────────────────────────────────────────────────────────────
     user_input = st.chat_input("Ask a question about your research papers…")
@@ -211,67 +231,55 @@ with tab_chat:
             st.error("⚠️ SARVAM_API_KEY not found. Add it to your .env file and restart.")
             st.stop()
 
-        # Guard: DB must exist
-        # ChromaDB creates 'db_v2' folder even if it's empty, so we must check for actual DB files
-        db_has_data = os.path.exists(DB_DIR) and (
-            os.path.exists(os.path.join(DB_DIR, "chroma.sqlite3")) or 
-            len(os.listdir(DB_DIR)) > 0
-        )
-        if not db_has_data:
-            st.error(
-                "⚠️ Knowledge base is empty. "
-                "Go to the **📁 Upload Documents** tab to add your PDFs first."
-            )
-            st.stop()
-
-        # Display user message
+        # Display user message instantly inside the scrollable container
         st.session_state.messages.append({"role": "user", "content": user_input})
-        with st.chat_message("user"):
-            st.markdown(user_input)
+        with chat_container:
+            with st.chat_message("user"):
+                st.markdown(user_input)
 
-        # Build chat_history from prior session (exclude current user turn)
-        history_msgs = [
-            {"role": m["role"], "content": m["content"]}
-            for m in st.session_state.messages[:-1]
-            if m["role"] in ("user", "assistant")
-        ]
+            # Build chat_history from prior session (exclude current user turn)
+            history_msgs = [
+                {"role": m["role"], "content": m["content"]}
+                for m in st.session_state.messages[:-1]
+                if m["role"] in ("user", "assistant")
+            ]
 
-        sources = []
+            sources = []
 
-        # Run the agent with streaming
-        with st.chat_message("assistant"):
-            try:
-                from agent_logic import run_query_stream
+            # Run the agent with streaming inside the container
+            with st.chat_message("assistant"):
+                try:
+                    from agent_logic import run_query_stream
 
-                def _stream_and_capture():
-                    gen = run_query_stream(user_input, chat_history=history_msgs)
-                    try:
-                        while True:
-                            token = next(gen)
-                            yield token
-                    except StopIteration as e:
-                        if e.value:
-                            sources.extend(e.value)
+                    def _stream_and_capture():
+                        gen = run_query_stream(user_input, chat_history=history_msgs)
+                        try:
+                            while True:
+                                token = next(gen)
+                                yield token
+                        except StopIteration as e:
+                            if e.value:
+                                sources.extend(e.value)
 
-                # Phase 1 — retrieval status banner
-                status = st.status("🔍 Retrieving and re-ranking documents…", expanded=False)
-                stream_gen = _stream_and_capture()
+                    # Phase 1 — retrieval status banner
+                    status = st.status("🔍 Retrieving and re-ranking documents…", expanded=False)
+                    stream_gen = _stream_and_capture()
 
-                # Pull first token (blocks until retrieval/grading done)
-                first_token = next(stream_gen, None)
-                status.update(label="✅ Retrieved — generating answer", state="complete")
+                    # Pull first token (blocks until retrieval/grading done)
+                    first_token = next(stream_gen, None)
+                    status.update(label="✅ Retrieved — generating answer", state="complete")
 
-                def _full_stream():
-                    if first_token is not None:
-                        yield first_token
-                    yield from stream_gen
+                    def _full_stream():
+                        if first_token is not None:
+                            yield first_token
+                        yield from stream_gen
 
-                answer = st.write_stream(_full_stream())
+                    answer = st.write_stream(_full_stream())
 
-            except Exception as e:
-                answer  = f"❌ An error occurred: {str(e)}"
-                st.markdown(answer)
-                sources = []
+                except Exception as e:
+                    answer  = f"❌ An error occurred: {str(e)}"
+                    st.markdown(answer)
+                    sources = []
 
             # ── Sources & PDF Page Preview ───────────────────────────────
             if sources:
