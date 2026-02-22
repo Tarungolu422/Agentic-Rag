@@ -11,10 +11,10 @@ env/
 venv/
 ENV/
 
-# Database and Data
-db_v2/
-sarvam_db/
-data/
+# Database and Data (Commented out to push pre-ingested data to Cloud)
+# db_v2/
+# sarvam_db/
+# data/
 
 # OS generated files
 .DS_Store
