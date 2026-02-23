@@ -23,7 +23,6 @@ load_dotenv()
 
 import chromadb
 from chromadb.config import Settings
-from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_chroma import Chroma
 from langchain_huggingface import HuggingFaceEmbeddings
@@ -185,12 +184,8 @@ def ingest(force_rebuild: bool = False):
         print("[ingest] ✅ Nothing to do — all files are already ingested.")
         return
 
-    # ── Optional OCR fallback ─────────────────────────────────────────────────
-    try:
-        import ocr_engine
-        from langchain_core.documents import Document as LCDoc
-    except ImportError:
-        ocr_engine = None
+    import ocr_engine
+    from langchain_core.documents import Document as LCDoc
 
     # ── Load new files ────────────────────────────────────────────────────────
     print(f"\n[ingest] Loading {len(new_files)} new file(s) ...")
@@ -203,24 +198,18 @@ def ingest(force_rebuild: bool = False):
             docs = []
             captions = []
             if fname.lower().endswith(".pdf"):
-                try:
-                    docs = PyPDFLoader(fpath).load()
-                except Exception as enc_err:
-                    print(f"  ⚠️  {fname} encoding issue ({enc_err}), retrying ...")
-                    docs = PyPDFLoader(fpath, extraction_mode="plain").load()
-
-                # Low text density → try Sarvam OCR
-                total_chars = sum(len(d.page_content.strip()) for d in docs)
-                avg_chars   = total_chars / len(docs) if docs else 0
-                if avg_chars < 50 and ocr_engine:
-                    print(f"  🔍 {fname} looks scanned (avg {avg_chars:.1f} chars/page), running OCR ...")
+                if ocr_engine:
+                    print(f"  🔍 {fname} is a PDF, running rigorous OCR extraction ...")
                     ocr_texts = ocr_engine.ocr_pdf(fpath)
                     if ocr_texts:
                         docs = [
                             LCDoc(page_content=t, metadata={"filename": fname, "page": i})
                             for i, t in enumerate(ocr_texts)
                         ]
+                else:
+                    print(f"  ⚠️  ocr_engine is missing! Cannot process {fname}.")
                 
+                # We can still extract captions from the OCR docs
                 captions = extract_figure_captions(docs, fname)
 
             elif fname.lower().endswith((".png", ".jpg", ".jpeg")):
