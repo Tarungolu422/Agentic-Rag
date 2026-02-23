@@ -95,44 +95,21 @@ with tab_upload:
         label_visibility="visible",
     )
 
+    if uploaded_files:
+        os.makedirs(DATA_DIR, exist_ok=True)
+        for f in uploaded_files:
+            dest = os.path.join(DATA_DIR, f.name)
+            if not os.path.exists(dest):
+                with open(dest, "wb") as out:
+                    out.write(f.getbuffer())
+
     col1, col2, col3 = st.columns([2, 1, 2])
     with col2:
         process_btn = st.button("⚡ Process & Ingest", type="primary", use_container_width=True)
 
     if uploaded_files and process_btn:
-        os.makedirs(DATA_DIR, exist_ok=True)
-
-        # ── Step 1: Save uploaded files ────────────────────────────────────────
         st.markdown("---")
-        st.markdown("#### Processing files…")
-        progress_bar = st.progress(0, text="Saving files…")
-
-        saved = []
-        skipped = []
-        for idx, f in enumerate(uploaded_files):
-            dest = os.path.join(DATA_DIR, f.name)
-            if os.path.exists(dest):
-                skipped.append(f.name)
-            else:
-                with open(dest, "wb") as out:
-                    out.write(f.getbuffer())
-                saved.append(f.name)
-            progress_bar.progress(
-                int((idx + 1) / len(uploaded_files) * 40),
-                text=f"Saving {f.name}…",
-            )
-
-        if skipped:
-            st.info(f"ℹ️ Already in library (skipped): {', '.join(skipped)}")
-
-        if not saved:
-            st.warning("No new files to process — all uploads already exist in the library.")
-            st.stop()
-
-        st.success(f"✅ Saved {len(saved)} new file(s): {', '.join(saved)}")
-
-        # ── Step 2: Ingest into ChromaDB ───────────────────────────────────────
-        progress_bar.progress(50, text="Loading embedding model…")
+        progress_bar = st.progress(50, text="Loading embedding model & ingesting…")
         try:
             # ✅ CRITICAL: Clear cached ChromaDB connection BEFORE ingest opens the DB.
             # Without this, two PersistentClients try to hold the same file and
@@ -144,7 +121,7 @@ with tab_upload:
             progress_bar.progress(100, text="Done!")
             st.balloons()
             st.success(
-                f"🎉 **Successfully Added!** {len(saved)} document(s) have been processed "
+                f"🎉 **Successfully Ingested!** Documents have been processed "
                 "and added to your knowledge base. Switch to the **💬 Chat** tab to start asking questions."
             )
         except Exception as e:
@@ -154,7 +131,7 @@ with tab_upload:
     elif uploaded_files and not process_btn:
         # Preview the selected files before processing
         st.markdown("---")
-        st.markdown(f"**{len(uploaded_files)} file(s) selected** — click **⚡ Process & Ingest** to add them.")
+        st.markdown(f"**{len(uploaded_files)} file(s) auto-saved!** — click **⚡ Process & Ingest** to index them into the database.")
         for f in uploaded_files:
             size_kb = len(f.getvalue()) / 1024
             st.markdown(f"- 📄 `{f.name}` ({size_kb:.1f} KB)")
