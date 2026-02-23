@@ -22,6 +22,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 import chromadb
+from chromadb.config import Settings
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_chroma import Chroma
@@ -62,7 +63,29 @@ def _save_tracked_files(filenames: set):
 def _make_vectorstore(embeddings) -> Chroma:
     """Open (or create) the ChromaDB collection using an explicit PersistentClient.
     This avoids the 'default_tenant not found' error in ChromaDB ≥1.5."""
-    client = chromadb.PersistentClient(path=DB_DIR)
+    
+    # Configure Chroma to use WAL (Write-Ahead Logging) and a higher busy timeout
+    # This prevents the 'code: 1032 attempt to write a readonly database' error
+    # caused by Streamlit keeping the DB open in the background.
+    settings = Settings(
+        anonymized_telemetry=False,
+        allow_reset=True,
+        is_persistent=True,
+    )
+    
+    client = chromadb.PersistentClient(path=DB_DIR, settings=settings)
+    
+    # Try forcing PRAGMA statements on the raw sqlite3 connection if possible
+    try:
+        import sqlite3
+        conn = sqlite3.connect(os.path.join(DB_DIR, "chroma.sqlite3"), timeout=60)
+        conn.execute("PRAGMA journal_mode=WAL;")
+        conn.execute("PRAGMA busy_timeout=60000;")
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        print(f"[ingest] Warning: Could not set sqlite pragmas: {e}")
+
     return Chroma(
         client=client,
         collection_name=COLLECTION_NAME,
