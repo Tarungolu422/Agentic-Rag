@@ -52,24 +52,29 @@ with st.sidebar:
 
 
 
-    st.markdown("---")
-    st.caption("⚙️ **Advanced:**")
-    if st.button("🔄 Force Rebuild Database"):
-        with st.spinner("⏳ Rebuilding from scratch..."):
-            try:
-                # Clear the cached graph/ChromaDB connection FIRST to avoid WinError 32
-                st.cache_resource.clear()
-                from ingest import ingest
-                ingest(force_rebuild=True)
-                st.success("✅ Database rebuilt!")
-                st.rerun()
-            except Exception as e:
-                st.error(f"❌ {e}")
+    # (Removed Force Rebuild button. To rebuild, run `python ingest.py --rebuild` via CLI)
 
 
-# ── Session state ──────────────────────────────────────────────────────────────
+# ── Session state & Auto-Init ──────────────────────────────────────────────────
 if "messages" not in st.session_state:
     st.session_state.messages = []
+
+db_has_data = False
+if os.path.exists(DB_DIR):
+    tracking_file = os.path.join(DB_DIR, ".ingested_files.json")
+    db_has_data = os.path.exists(os.path.join(DB_DIR, "chroma.sqlite3")) or os.path.exists(tracking_file)
+
+if not db_has_data and os.path.exists(DATA_DIR) and any(f.endswith((".pdf", ".png", ".jpg", ".jpeg")) for f in os.listdir(DATA_DIR)):
+    st.info("🔄 **First-time setup detected.** Building your knowledge base from default documents... This may take a moment.")
+    try:
+        st.cache_resource.clear()
+        from ingest import ingest
+        ingest(force_rebuild=True)
+        db_has_data = True
+        st.success("✅ Database setup complete!")
+        st.rerun()
+    except Exception as e:
+        st.error(f"❌ Failed to build initial database: {e}")
 
 
 # ── Tabs: Chat | Upload ────────────────────────────────────────────────────────
@@ -181,12 +186,7 @@ with tab_chat:
                         else:
                             st.markdown(f"- `{src}`")
 
-    # Guard: DB must exist
-    db_has_data = False
-    if os.path.exists(DB_DIR):
-        tracking_file = os.path.join(DB_DIR, ".ingested_files.json")
-        db_has_data = os.path.exists(os.path.join(DB_DIR, "chroma.sqlite3")) or os.path.exists(tracking_file)
-
+    # Guard: DB must exist (already checked at app boot, but we'll use the variable)
     if not db_has_data:
         st.warning(
             "⚠️ **Knowledge base is empty!**\n\n"
