@@ -308,7 +308,8 @@ def route_after_grade(state: AgentState) -> str:
     if state["documents"]:
         return "generate"
     if state.get("rewrite_count", 0) >= MAX_REWRITES:
-        return "no_answer"
+        # Pass empty documents to generation so the LLM can run its diagnostic prompt
+        return "generate"
     return "rewrite"
 
 
