@@ -33,7 +33,7 @@ EMBED_MODEL     = "sentence-transformers/all-MiniLM-L6-v2"
 SARVAM_MODEL    = "sarvam-m"          # Correct Sarvam AI model name
 SARVAM_BASE_URL = "https://api.sarvam.ai/v1"  # LangChain appends /chat/completions
 TOP_K_RETRIEVE  = 10
-TOP_K_FINAL     = 5
+TOP_K_FINAL     = 8
 MAX_REWRITES    = 2
 FAITHFULNESS_THRESHOLD = 0.20
 # ──────────────────────────────────────────────────────────────────────────────

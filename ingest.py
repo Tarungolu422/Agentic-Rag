@@ -33,8 +33,8 @@ DATA_DIR        = "./data"
 DB_DIR          = "./sarvam_db"
 COLLECTION_NAME = "rag_docs"          # Must match agent_logic.py
 TRACKING_FILE   = os.path.join(DB_DIR, ".ingested_files.json")  # ← source of truth
-CHUNK_SIZE      = 1200
-CHUNK_OVERLAP   = 200
+CHUNK_SIZE      = 1000
+CHUNK_OVERLAP   = 150
 MAX_FILES       = None                # None = ingest ALL PDFs
 EMBED_MODEL     = "sentence-transformers/all-MiniLM-L6-v2"
 # ──────────────────────────────────────────────────────────────────────────────
