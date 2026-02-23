@@ -25,19 +25,21 @@ st.markdown(
     <style>
     .watermark {
         position: fixed;
-        bottom: 10px;
-        right: 15px;
-        opacity: 0.15;
-        font-size: 80px;
+        top: 40%;
+        left: 50%;
+        transform: translate(-50%, -50%) rotate(-25deg);
+        opacity: 0.08;
+        font-size: 8vw;
         font-weight: 900;
-        color: #888888;
-        z-index: 9999;
+        font-family: sans-serif;
+        color: #555555;
+        white-space: nowrap;
+        z-index: 1;
         pointer-events: none;
         user-select: none;
-        transform: rotate(-15deg);
     }
     </style>
-    <div class="watermark">tarungolu422</div>
+    <div class="watermark">TARUNGOLU422</div>
     """,
     unsafe_allow_html=True
 )
@@ -72,6 +74,15 @@ with st.sidebar:
     if st.button("🗑️ Clear Chat History"):
         st.session_state.messages = []
         st.rerun()
+
+    st.markdown("---")
+    st.markdown(
+        "<div style='text-align: center; color: #888; font-size: 0.85em; margin-top: 20px;'>"
+        "🛠️ Built with <span style='color: #e25555;'>❤️</span> by<br>"
+        "<b>Tarun Kumar Rathore</b>"
+        "</div>",
+        unsafe_allow_html=True
+    )
 
 
 
