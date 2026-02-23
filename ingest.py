@@ -128,11 +128,27 @@ def ingest(force_rebuild: bool = False):
 
     # ── Wipe if force_rebuild ─────────────────────────────────────────────────
     if force_rebuild:
-        if os.path.exists(DB_DIR):
-            print(f"[ingest] force_rebuild — deleting '{DB_DIR}' ...")
-            shutil.rmtree(DB_DIR)
-            print("[ingest] DB deleted.")
-        # Tracking file is inside DB_DIR, so it's already gone.
+        print(f"[ingest] force_rebuild — safely resetting ChromaDB ...")
+        
+        settings = Settings(
+            anonymized_telemetry=False,
+            allow_reset=True,
+            is_persistent=True,
+        )
+        try:
+            client = chromadb.PersistentClient(path=DB_DIR, settings=settings)
+            client.reset()
+            print("[ingest] ChromaDB wiped via client.reset().")
+        except Exception as e:
+            print(f"[ingest] Warning during reset: {e}")
+            
+        # Manually clear our JSON tracking file
+        if os.path.exists(TRACKING_FILE):
+            os.remove(TRACKING_FILE)
+            
+        already_ingested = set()
+    else:
+        already_ingested = _load_tracked_files()
 
     os.makedirs(DB_DIR, exist_ok=True)
 
@@ -143,9 +159,6 @@ def ingest(force_rebuild: bool = False):
         model_kwargs={"device": "cpu"},
         encode_kwargs={"normalize_embeddings": True},
     )
-
-    # ── Check which files are already tracked ─────────────────────────────────
-    already_ingested = _load_tracked_files()
 
     if not os.path.exists(DATA_DIR):
         raise FileNotFoundError(f"Data folder '{DATA_DIR}' not found.")
