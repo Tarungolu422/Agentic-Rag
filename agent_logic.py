@@ -87,9 +87,11 @@ def _build_llm():
 
 
 # ── Graph State ───────────────────────────────────────────────────────────────
-class AgentState(TypedDict):
+class AgentState(TypedDict, total=False):
     question:      str
+    search_query:  str
     documents:     List[Document]
+    draft_generation: str
     generation:    str
     sources:       List[str]
     rewrite_count: int
@@ -143,23 +145,73 @@ REWRITE_PROMPT = ChatPromptTemplate.from_messages([
     ("human", "Original query: {question}"),
 ])
 
-FAITHFULNESS_PROMPT = ChatPromptTemplate.from_messages([
+OPTIMIZE_PROMPT = ChatPromptTemplate.from_messages([
     ("system",
-     "You are a faithfulness verifier for a RAG system.\n"
-     "Score how faithful the answer is to the context on a scale 0.0-1.0.\n"
-     "1.0=every claim supported, 0.5-0.9=mostly supported, "
-     "0.1-0.4=significant unsupported claims, 0.0=fabricated.\n"
-     "Output ONLY the float, e.g. 0.87"),
-    ("human", "Question: {question}\n\nContext:\n{context}\n\nAnswer:\n{answer}"),
+     "You are a query optimizer for a research paper RAG system. "
+     "Your task is to take the user's conversational question and rewrite it into a highly effective search query. "
+     "Extract key terms, ignore conversational filler, and include relevant synonyms. "
+     "Respond ONLY with the optimized search string, nothing else."),
+    ("human", "{question}"),
 ])
 
+POST_PROCESS_PROMPT = ChatPromptTemplate.from_messages([
+    ("system",
+     "You are a strict LLM output post-processor. "
+     "Your task is to review the drafted 'Answer' given the 'Context' and 'Question'. "
+     "1. Fix any formatting issues (ensure good markdown). "
+     "2. Remove any claims in the Answer that are NOT supported by the Context (hallucinations). "
+     "3. If the Answer is completely unfaithful, rewrite it to simply state that the context lacks the information. "
+     "Respond ONLY with the final, polished response text, nothing else."),
+    ("human", "Question: {question}\n\nContext:\n{context}\n\nDraft Answer:\n{answer}"),
+])
 
 # ── Node functions ─────────────────────────────────────────────────────────────
-def retrieve_node(state: AgentState, retriever) -> AgentState:
-    print(f"[retrieve] Searching: '{state['question']}'")
-    docs = retriever.invoke(state["question"])
-    print(f"[retrieve] Found {len(docs)} chunks.")
-    return {**state, "documents": docs}
+def query_optimizer_node(state: AgentState, llm) -> AgentState:
+    print(f"[optimize] Raw query: '{state['question']}'")
+    optimizer = OPTIMIZE_PROMPT | llm | StrOutputParser()
+    optimized_q = optimizer.invoke({"question": state["question"]}).strip()
+    print(f"[optimize] Optimized search query: '{optimized_q}'")
+    return {**state, "search_query": optimized_q}
+
+def retrieve_node(state: AgentState, retriever, bm25_data) -> AgentState:
+    sq = state.get("search_query", state["question"])
+    print(f"[retrieve] Searching dense & sparse for: '{sq}'")
+    
+    # 1. Dense Retrieval
+    dense_docs = retriever.invoke(sq)
+    
+    # 2. Sparse Retrieval (BM25)
+    sparse_docs = []
+    if bm25_data and "bm25" in bm25_data:
+        bm25 = bm25_data["bm25"]
+        all_chunks = bm25_data["chunks"]
+        tokenized_query = sq.lower().split()
+        
+        sparse_scores = bm25.get_scores(tokenized_query)
+        top_k_indices = sorted(range(len(sparse_scores)), key=lambda i: sparse_scores[i], reverse=True)[:TOP_K_RETRIEVE]
+        
+        for idx in top_k_indices:
+            if sparse_scores[idx] > 0:
+                sparse_docs.append(all_chunks[idx])
+                
+    # 3. Reciprocal Rank Fusion
+    fused_scores = {}
+    
+    def add_to_fusion(docs, weight=1.0):
+        for rank, doc in enumerate(docs):
+            doc_key = doc.page_content
+            if doc_key not in fused_scores:
+                fused_scores[doc_key] = {"score": 0.0, "doc": doc}
+            fused_scores[doc_key]["score"] += weight / (rank + 60)
+            
+    add_to_fusion(dense_docs, weight=1.0)
+    add_to_fusion(sparse_docs, weight=1.0)
+    
+    reranked = sorted(fused_scores.values(), key=lambda x: x["score"], reverse=True)
+    fused_docs = [item["doc"] for item in reranked[:TOP_K_RETRIEVE]]
+    
+    print(f"[retrieve] Found {len(dense_docs)} dense, {len(sparse_docs)} sparse. Fused: {len(fused_docs)} chunks.")
+    return {**state, "documents": fused_docs}
 
 
 def rerank_node(state: AgentState, llm) -> AgentState:
@@ -241,40 +293,36 @@ def generate_node(state: AgentState, llm) -> AgentState:
     generator = GENERATE_PROMPT | llm | StrOutputParser()
     answer = generator.invoke({"question": state["question"], "context": context, "chat_history": lc_history})
     print(f"[generate] Done. Sources: {sources_metadata}")
-    return {**state, "generation": answer, "sources": sources_metadata, "context": context}
+    return {**state, "draft_generation": answer, "sources": sources_metadata, "context": context}
 
 
-def faithfulness_node(state: AgentState, llm) -> AgentState:
-    answer, context, question = state.get("generation", ""), state.get("context", ""), state["question"]
-    if not answer or not context:
-        return state
-    print("[faithfulness] Verifying ...")
-    verifier = FAITHFULNESS_PROMPT | llm | StrOutputParser()
-    import re
+def post_processor_node(state: AgentState, llm) -> AgentState:
+    draft = state.get("draft_generation", "")
+    context = state.get("context", "")
+    question = state["question"]
+    
+    if not draft or not context:
+        return {**state, "generation": draft}
+        
+    print("[post_process] Polishing response and checking faithfulness ...")
+    processor = POST_PROCESS_PROMPT | llm | StrOutputParser()
     try:
-        raw = verifier.invoke({"question": question, "context": context[:8000], "answer": answer}).strip()
-        match = re.search(r'0\.\d+|1\.0|0', raw)
-        score = float(match.group(0)) if match else 1.0
+        final_answer = processor.invoke({"question": question, "context": context[:8000], "answer": draft}).strip()
     except Exception as e:
-        print(f"[faithfulness] Could not parse score ({e}). Accepting answer.")
-        score = 1.0
-    print(f"[faithfulness] Score: {score:.2f} (threshold: {FAITHFULNESS_THRESHOLD})")
-    if score < FAITHFULNESS_THRESHOLD:
-        return {**state, "generation": (
-            "⚠️ **Faithfulness Warning**: The generated answer could not be fully verified "
-            f"against the retrieved documents (score: {score:.2f}). "
-            "Please try rephrasing your question."
-        )}
-    return state
+        print(f"[post_process] Warning: {e}. Passing draft answer as fallback.")
+        final_answer = draft
+        
+    return {**state, "generation": final_answer}
 
 
 def rewrite_node(state: AgentState, llm) -> AgentState:
     count = state.get("rewrite_count", 0) + 1
     print(f"[rewrite] Attempt {count} ...")
     rewriter = REWRITE_PROMPT | llm | StrOutputParser()
-    new_q = rewriter.invoke({"question": state["question"]})
-    print(f"[rewrite] New query: '{new_q}'")
-    return {**state, "question": new_q, "rewrite_count": count}
+    sq = state.get("search_query", state["question"])
+    new_q = rewriter.invoke({"question": sq}).strip()
+    print(f"[rewrite] New search query: '{new_q}'")
+    return {**state, "search_query": new_q, "rewrite_count": count}
 
 
 def no_answer_node(state: AgentState) -> AgentState:
@@ -294,25 +342,40 @@ def route_after_grade(state: AgentState) -> str:
 
 
 # ── Graph builder ──────────────────────────────────────────────────────────────
+def _load_bm25():
+    import pickle
+    bm25_path = os.path.join(DB_DIR, "bm25_index.pkl")
+    if os.path.exists(bm25_path):
+        try:
+            with open(bm25_path, "rb") as f:
+                return pickle.load(f)
+        except Exception as e:
+            print(f"Warning: Could not load BM25 index: {e}")
+    return None
+
 def build_graph():
     retriever = _build_retriever()
     llm       = _build_llm()
+    bm25_data = _load_bm25()
     graph     = StateGraph(AgentState)
-    graph.add_node("retrieve",     lambda s: retrieve_node(s, retriever))
+    graph.add_node("optimize",     lambda s: query_optimizer_node(s, llm))
+    graph.add_node("retrieve",     lambda s: retrieve_node(s, retriever, bm25_data))
     graph.add_node("rerank",       lambda s: rerank_node(s, llm))
     graph.add_node("grade",        lambda s: grade_node(s, llm))
     graph.add_node("generate",     lambda s: generate_node(s, llm))
-    graph.add_node("faithfulness", lambda s: faithfulness_node(s, llm))
+    graph.add_node("post_process", lambda s: post_processor_node(s, llm))
     graph.add_node("rewrite",      lambda s: rewrite_node(s, llm))
     graph.add_node("no_answer",    no_answer_node)
-    graph.set_entry_point("retrieve")
+    
+    graph.set_entry_point("optimize")
+    graph.add_edge("optimize",  "retrieve")
     graph.add_edge("retrieve",  "rerank")
     graph.add_edge("rerank",    "grade")
     graph.add_conditional_edges("grade", route_after_grade,
         {"generate": "generate", "rewrite": "rewrite", "no_answer": "no_answer"})
     graph.add_edge("rewrite",      "retrieve")
-    graph.add_edge("generate",     "faithfulness")
-    graph.add_edge("faithfulness", END)
+    graph.add_edge("generate",     "post_process")
+    graph.add_edge("post_process", END)
     graph.add_edge("no_answer",    END)
     return graph.compile()
 
@@ -340,7 +403,7 @@ def run_query(question: str, chat_history: Optional[List[dict]] = None) -> dict:
     """Blocking call — returns {answer, sources}."""
     app = get_app()
     final_state = app.invoke({
-        "question": question, "documents": [], "generation": "",
+        "question": question, "search_query": question, "documents": [], "generation": "",
         "sources": [], "rewrite_count": 0, "context": "", "chat_history": chat_history or [],
     })
     return {"answer": final_state.get("generation", "No answer generated."),
@@ -357,7 +420,7 @@ def run_query_stream(
     """
     app = get_app()
     init_state = {
-        "question": question, "documents": [], "generation": "",
+        "question": question, "search_query": question, "documents": [], "generation": "",
         "sources": [], "rewrite_count": 0, "context": "", "chat_history": chat_history or [],
     }
     prev_generation = ""

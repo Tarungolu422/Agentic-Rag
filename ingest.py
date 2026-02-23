@@ -18,6 +18,8 @@ import os
 import re
 import json
 import shutil
+import pickle
+from rank_bm25 import BM25Okapi
 from dotenv import load_dotenv
 load_dotenv()
 
@@ -145,6 +147,10 @@ def ingest(force_rebuild: bool = False):
         if os.path.exists(TRACKING_FILE):
             os.remove(TRACKING_FILE)
             
+        bm25_path = os.path.join(DB_DIR, "bm25_index.pkl")
+        if os.path.exists(bm25_path):
+            os.remove(bm25_path)
+            
         already_ingested = set()
     else:
         already_ingested = _load_tracked_files()
@@ -255,6 +261,66 @@ def ingest(force_rebuild: bool = False):
     text_chunks = splitter.split_documents(text_docs)
     all_chunks  = text_chunks + caption_docs
     print(f"[ingest] {len(text_chunks)} text + {len(caption_docs)} captions = {len(all_chunks)} chunks")
+
+    # ── LLM Enrichment ────────────────────────────────────────────────────────
+    print("\n[ingest] Enriching chunks with LLM summaries ...")
+    from langchain_openai import ChatOpenAI
+    from langchain_core.prompts import ChatPromptTemplate
+    from langchain_core.output_parsers import StrOutputParser
+    import httpx
+    
+    SARVAM_KEY = os.environ.get("SARVAM_API_KEY", "")
+    if SARVAM_KEY:
+        http_client = httpx.Client(verify=False, headers={"api-subscription-key": SARVAM_KEY})
+        llm = ChatOpenAI(
+            model="sarvam-m",
+            temperature=0,
+            http_client=http_client,
+            api_key=SARVAM_KEY,
+            base_url="https://api.sarvam.ai/v1",
+        )
+        enrich_prompt = ChatPromptTemplate.from_messages([
+            ("system", "You are a document enrichment AI. Read the following chunk of text and provide a concise 1-sentence summary covering its main points and any key entities (like acronyms, names, or numbers). This will be used for vector search. Respond ONLY with the summary."),
+            ("human", "{chunk}"),
+        ])
+        enrich_chain = enrich_prompt | llm | StrOutputParser()
+        
+        for i, chunk in enumerate(all_chunks):
+            if chunk.metadata.get("source_type") == "figure_caption":
+                continue
+            try:
+                if i % 10 == 0:
+                    print(f"  Enriching chunk {i+1}/{len(all_chunks)} ...")
+                # Invoke LLM
+                summary = enrich_chain.invoke({"chunk": chunk.page_content}).strip()
+                # Update chunk
+                chunk.metadata["llm_summary"] = summary
+                chunk.page_content = f"SUMMARY: {summary}\n\nORIGINAL TEXT:\n{chunk.page_content}"
+            except Exception as e:
+                print(f"  Warning: LLM Enrichment failed for chunk {i+1}: {e}")
+    else:
+        print("[ingest] Skipping enrichment: SARVAM_API_KEY not found.")
+
+    # ── BM25 Indexing ─────────────────────────────────────────────────────────
+    print("\n[ingest] Building/Updating BM25 Index ...")
+    bm25_path = os.path.join(DB_DIR, "bm25_index.pkl")
+    existing_chunks = []
+    
+    if not force_rebuild and os.path.exists(bm25_path):
+        try:
+            with open(bm25_path, "rb") as f:
+                data = pickle.load(f)
+                existing_chunks = data.get("chunks", [])
+        except Exception as e:
+            print(f"[ingest] Warning: Could not load existing BM25 index ({e}). Starting fresh.")
+            
+    combined_chunks = existing_chunks + all_chunks
+    tokenized_corpus = [chunk.page_content.lower().split() for chunk in combined_chunks]
+    
+    bm25 = BM25Okapi(tokenized_corpus)
+    with open(bm25_path, "wb") as f:
+        pickle.dump({"bm25": bm25, "chunks": combined_chunks}, f)
+    print(f"[ingest] BM25 Index saved. Total chunks in BM25: {len(combined_chunks)}.")
 
     # ── Embed & store ─────────────────────────────────────────────────────────
     print(f"[ingest] Embedding {len(all_chunks)} chunks into ChromaDB ...")

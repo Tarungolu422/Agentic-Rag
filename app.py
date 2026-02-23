@@ -236,12 +236,12 @@ if db_has_data:
                                 sources.extend(e.value)
 
                     # Phase 1 — retrieval status banner
-                    status = st.status("🔍 Retrieving and re-ranking documents…", expanded=False)
+                    status = st.status("🔍 Optimizing query & retrieving documents…", expanded=False)
                     stream_gen = _stream_and_capture()
 
                     # Pull first token (blocks until retrieval/grading done)
                     first_token = next(stream_gen, None)
-                    status.update(label="✅ Retrieved — generating answer", state="complete")
+                    status.update(label="✅ Retrieved & Polished — generating answer", state="complete")
 
                     def _full_stream():
                         if first_token is not None:
