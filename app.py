@@ -164,13 +164,15 @@ with tab_upload:
     with st.expander("📚 Current Knowledge Base", expanded=False):
         data_files = []
         if os.path.exists(DATA_DIR):
-            data_files = sorted([
-                f for f in os.listdir(DATA_DIR)
-                if f.lower().endswith((".pdf", ".png", ".jpg", ".jpeg"))
-            ])
+            for root, _, files in os.walk(DATA_DIR):
+                for f in files:
+                    if f.lower().endswith((".pdf", ".png", ".jpg", ".jpeg")):
+                        rel_path = os.path.relpath(os.path.join(root, f), DATA_DIR)
+                        data_files.append(rel_path.replace("\\", "/"))
+            data_files.sort()
 
         if data_files:
-            st.caption(f"{len(data_files)} file(s) in `./data/`")
+            st.caption(f"{len(data_files)} file(s) in `./data/` and subfolders")
             for fname in data_files:
                 fpath = os.path.join(DATA_DIR, fname)
                 size_kb = os.path.getsize(fpath) / 1024

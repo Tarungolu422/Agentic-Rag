@@ -115,7 +115,8 @@ GENERATE_PROMPT = ChatPromptTemplate.from_messages([
      "You are an expert research assistant. Answer the user's question strictly "
      "using the provided context from research papers.\n"
      "Rules:\n"
-     "1. If the answer is not in the context, say so. Do NOT hallucinate.\n"
+     "0. If the user is just saying hello or greeting you, respond with a friendly greeting and ask how you can help them with their research papers. Do NOT use context or cite sources for simple greetings.\n"
+     "1. If the exact answer is NOT explicitly stated in the context, say 'I cannot find the answer in the provided documents.' Do NOT hallucinate, guess, or use outside knowledge.\n"
      "2. Always cite filename(s) and page numbers using [Source: filename.pdf, Page: N].\n"
      "3. Be precise, thorough, and academic in tone.\n"
      "4. [FIGURE DESCRIPTION] chunks are figure/table captions extracted from the paper. "
@@ -162,11 +163,13 @@ def rerank_node(state: AgentState, llm) -> AgentState:
     print(f"[rerank] Scoring {len(docs)} chunks ...")
     scorer = RERANK_PROMPT | llm | StrOutputParser()
     scored = []
+    import re
     for doc in docs:
         try:
             raw = scorer.invoke({"question": state["question"], "document": doc.page_content})
-            score = int(raw.strip())
-        except (ValueError, AttributeError):
+            match = re.search(r'\b([0-9]|10)\b', raw)
+            score = int(match.group(1)) if match else 0
+        except Exception:
             score = 0
         scored.append((score, doc))
     scored.sort(key=lambda x: x[0], reverse=True)
@@ -183,13 +186,25 @@ def grade_node(state: AgentState, llm) -> AgentState:
     print(f"[grade] Batch-grading {len(docs)} chunks ...")
     chunks_text = "\n\n".join(f"[{i+1}] {doc.page_content[:600]}" for i, doc in enumerate(docs))
     grader = BATCH_GRADE_PROMPT | llm | StrOutputParser()
+    import re
     try:
         raw = grader.invoke({"question": state["question"], "chunks": chunks_text}).strip()
-        if raw.startswith("```"):
-            raw = raw.split("```")[1].strip().lstrip("json").strip()
+        
+        # Try finding the array inside the output if it's chatting
+        match = re.search(r'\[.*?\]', raw, re.DOTALL)
+        if match:
+            raw = match.group(0)
+            
         verdicts = json.loads(raw)
         if not isinstance(verdicts, list):
             raise ValueError("Not a list")
+            
+        # Ensure verdicts match doc count by truncating or padding
+        if len(verdicts) < len(docs):
+            verdicts += [False] * (len(docs) - len(verdicts))
+        elif len(verdicts) > len(docs):
+            verdicts = verdicts[:len(docs)]
+            
     except Exception as e:
         print(f"[grade] Warning: could not parse response ({e}). Keeping all chunks.")
         verdicts = [True] * len(docs)
@@ -229,8 +244,11 @@ def faithfulness_node(state: AgentState, llm) -> AgentState:
         return state
     print("[faithfulness] Verifying ...")
     verifier = FAITHFULNESS_PROMPT | llm | StrOutputParser()
+    import re
     try:
-        score = float(verifier.invoke({"question": question, "context": context[:8000], "answer": answer}).strip())
+        raw = verifier.invoke({"question": question, "context": context[:8000], "answer": answer}).strip()
+        match = re.search(r'0\.\d+|1\.0|0', raw)
+        score = float(match.group(0)) if match else 1.0
     except Exception as e:
         print(f"[faithfulness] Could not parse score ({e}). Accepting answer.")
         score = 1.0

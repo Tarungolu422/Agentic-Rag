@@ -127,18 +127,26 @@ def ingest(force_rebuild: bool = False):
     if not os.path.exists(DATA_DIR):
         raise FileNotFoundError(f"Data folder '{DATA_DIR}' not found.")
 
-    all_pdfs = sorted(f for f in os.listdir(DATA_DIR) if f.lower().endswith(".pdf"))
+    all_files = []
+    for root, _, files in os.walk(DATA_DIR):
+        for f in files:
+            if f.lower().endswith((".pdf", ".png", ".jpg", ".jpeg")):
+                # Use a relative path so we can uniquely identify files in subfolders
+                rel_path = os.path.relpath(os.path.join(root, f), DATA_DIR)
+                all_files.append(rel_path.replace("\\", "/"))
+    
+    all_files.sort()
     if MAX_FILES is not None:
-        all_pdfs = all_pdfs[:MAX_FILES]
+        all_files = all_files[:MAX_FILES]
 
-    new_pdfs = [f for f in all_pdfs if f not in already_ingested]
+    new_files = [f for f in all_files if f not in already_ingested]
 
-    print(f"[ingest] PDFs found:    {len(all_pdfs)}")
+    print(f"[ingest] Files found:   {len(all_files)}")
     print(f"[ingest] Already done:  {len(already_ingested)}")
-    print(f"[ingest] New to ingest: {len(new_pdfs)}")
+    print(f"[ingest] New to ingest: {len(new_files)}")
 
-    if not new_pdfs:
-        print("[ingest] ✅ Nothing to do — all PDFs are already ingested.")
+    if not new_files:
+        print("[ingest] ✅ Nothing to do — all files are already ingested.")
         return
 
     # ── Optional OCR fallback ─────────────────────────────────────────────────
@@ -148,42 +156,62 @@ def ingest(force_rebuild: bool = False):
     except ImportError:
         ocr_engine = None
 
-    # ── Load new PDFs ─────────────────────────────────────────────────────────
-    print(f"\n[ingest] Loading {len(new_pdfs)} new PDF(s) ...")
+    # ── Load new files ────────────────────────────────────────────────────────
+    print(f"\n[ingest] Loading {len(new_files)} new file(s) ...")
     documents       = []
     successfully_loaded = []
 
-    for fname in new_pdfs:
+    for fname in new_files:
         fpath = os.path.join(DATA_DIR, fname)
         try:
-            try:
-                docs = PyPDFLoader(fpath).load()
-            except Exception as enc_err:
-                print(f"  ⚠️  {fname} encoding issue ({enc_err}), retrying ...")
-                docs = PyPDFLoader(fpath, extraction_mode="plain").load()
+            docs = []
+            captions = []
+            if fname.lower().endswith(".pdf"):
+                try:
+                    docs = PyPDFLoader(fpath).load()
+                except Exception as enc_err:
+                    print(f"  ⚠️  {fname} encoding issue ({enc_err}), retrying ...")
+                    docs = PyPDFLoader(fpath, extraction_mode="plain").load()
 
-            # Low text density → try Sarvam OCR
-            total_chars = sum(len(d.page_content.strip()) for d in docs)
-            avg_chars   = total_chars / len(docs) if docs else 0
-            if avg_chars < 50 and ocr_engine:
-                print(f"  🔍 {fname} looks scanned (avg {avg_chars:.1f} chars/page), running OCR ...")
-                ocr_texts = ocr_engine.ocr_pdf(fpath)
-                if ocr_texts:
-                    docs = [
-                        LCDoc(page_content=t, metadata={"filename": fname, "page": i})
-                        for i, t in enumerate(ocr_texts)
-                    ]
+                # Low text density → try Sarvam OCR
+                total_chars = sum(len(d.page_content.strip()) for d in docs)
+                avg_chars   = total_chars / len(docs) if docs else 0
+                if avg_chars < 50 and ocr_engine:
+                    print(f"  🔍 {fname} looks scanned (avg {avg_chars:.1f} chars/page), running OCR ...")
+                    ocr_texts = ocr_engine.ocr_pdf(fpath)
+                    if ocr_texts:
+                        docs = [
+                            LCDoc(page_content=t, metadata={"filename": fname, "page": i})
+                            for i, t in enumerate(ocr_texts)
+                        ]
+                
+                captions = extract_figure_captions(docs, fname)
+
+            elif fname.lower().endswith((".png", ".jpg", ".jpeg")):
+                if ocr_engine:
+                    print(f"  🖼️ {fname} is an image, running OCR ...")
+                    ocr_texts = ocr_engine.ocr_pdf(fpath)
+                    if ocr_texts:
+                        docs = [
+                            LCDoc(page_content=t, metadata={"filename": fname, "page": i})
+                            for i, t in enumerate(ocr_texts)
+                        ]
+                else:
+                    print(f"  ⚠️  {fname} is an image but ocr_engine is not available.")
 
             for i, doc in enumerate(docs):
                 doc.metadata["filename"]    = fname
                 doc.metadata.setdefault("source_type", "text")
                 doc.metadata.setdefault("page", i)
 
-            captions = extract_figure_captions(docs, fname)
             documents.extend(docs)
             documents.extend(captions)
-            successfully_loaded.append(fname)
-            print(f"  ✓ {fname} — {len(docs)} pages, {len(captions)} captions")
+            
+            if docs or captions:
+                successfully_loaded.append(fname)
+                print(f"  ✓ {fname} — {len(docs)} pages/chunks, {len(captions)} captions")
+            else:
+                print(f"  ✗ {fname} — skipped (no text could be extracted)")
 
         except Exception as e:
             print(f"  ✗ {fname} — skipped ({e})")
@@ -205,6 +233,14 @@ def ingest(force_rebuild: bool = False):
 
     # ── Embed & store ─────────────────────────────────────────────────────────
     print(f"[ingest] Embedding {len(all_chunks)} chunks into ChromaDB ...")
+    
+    # Inject filename into actual text content so it can be searched by name
+    for chunk in all_chunks:
+        fname = chunk.metadata.get("filename", "unknown")
+        prefix = f"Filename: {fname}\n\n"
+        if not chunk.page_content.startswith(prefix):
+            chunk.page_content = prefix + chunk.page_content
+
     vectorstore = _make_vectorstore(embeddings)
 
     batch_size = 5000
