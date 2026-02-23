@@ -46,8 +46,14 @@ def _build_retriever():
         model_kwargs={"device": "cpu", "trust_remote_code": True},
         encode_kwargs={"normalize_embeddings": True},
     )
+    from chromadb.config import Settings
+    settings = Settings(
+        anonymized_telemetry=False,
+        allow_reset=True,
+        is_persistent=True,
+    )
     # Use explicit PersistentClient to avoid ChromaDB 1.5 tenant errors
-    client = chromadb.PersistentClient(path=DB_DIR)
+    client = chromadb.PersistentClient(path=DB_DIR, settings=settings)
     vectorstore = Chroma(
         client=client,
         collection_name=COLLECTION_NAME,
