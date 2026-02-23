@@ -19,6 +19,29 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
+# ── Custom CSS Watermark ───────────────────────────────────────────────────────
+st.markdown(
+    """
+    <style>
+    .watermark {
+        position: fixed;
+        bottom: 10px;
+        right: 15px;
+        opacity: 0.15;
+        font-size: 80px;
+        font-weight: 900;
+        color: #888888;
+        z-index: 9999;
+        pointer-events: none;
+        user-select: none;
+        transform: rotate(-15deg);
+    }
+    </style>
+    <div class="watermark">tarungolu422</div>
+    """,
+    unsafe_allow_html=True
+)
+
 # ── Helpers ───────────────────────────────────────────────────────────────────
 DATA_DIR = "./data"
 DB_DIR   = "./sarvam_db"   # Renamed from db_v2
